@@ -89,7 +89,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
   # Replaces the unsafe 'curl -fsSL https://bun.sh/install | bash' pattern.
   if ! command -v bun &> /dev/null; then
     info "Installing Bun via Homebrew..."
-    brew install bun
+    brew install oven-sh/bun/bun
     success "Bun installed: $(bun --version)"
   else
     success "Bun found: $(bun --version)"
