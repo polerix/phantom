@@ -37,7 +37,7 @@ import { PeerHealthMonitor } from "./mcp/peer-health.ts";
 import { PeerManager } from "./mcp/peers.ts";
 import { PhantomMcpServer } from "./mcp/server.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
-import { type SessionData, consolidateSession } from "./memory/consolidation.ts";
+import { type SessionData, consolidateSession, consolidateSessionWithLLM } from "./memory/consolidation.ts";
 import { MemoryContextBuilder } from "./memory/context-builder.ts";
 import { MemorySystem } from "./memory/system.ts";
 import { isFirstRun, isOnboardingInProgress } from "./onboarding/detection.ts";
@@ -99,7 +99,8 @@ async function main(): Promise<void> {
 	try {
 		evolution = new EvolutionEngine();
 		const currentVersion = evolution.getCurrentVersion();
-		console.log(`[evolution] Engine initialized (v${currentVersion})`);
+		const judgeMode = evolution.usesLLMJudges() ? "LLM judges" : "heuristic";
+		console.log(`[evolution] Engine initialized (v${currentVersion}, ${judgeMode})`);
 		setEvolutionVersionProvider(() => evolution?.getCurrentVersion() ?? 0);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -179,13 +180,11 @@ async function main(): Promise<void> {
 		// Only the lightweight McpServer wrappers are recreated per query.
 		// This prevents "Already connected to a transport" crashes when the scheduler
 		// fires a query while a previous session's transport hasn't fully cleaned up.
-		const secretsBaseUrl = config.domain
-			? `https://${config.name}.${config.domain}`
-			: `http://localhost:${config.port}`;
+		const secretsBaseUrl = config.public_url ?? `http://localhost:${config.port}`;
 		runtime.setMcpServerFactories({
 			"phantom-dynamic-tools": () => createInProcessToolServer(registry),
 			"phantom-scheduler": () => createSchedulerToolServer(scheduler as Scheduler),
-			"phantom-web-ui": () => createWebUiToolServer(config.domain, config.name),
+			"phantom-web-ui": () => createWebUiToolServer(config.public_url),
 			"phantom-secrets": () => createSecretToolServer({ db, baseUrl: secretsBaseUrl }),
 			...(process.env.RESEND_API_KEY
 				? {
@@ -491,19 +490,41 @@ async function main(): Promise<void> {
 				outcome: response.text.startsWith("Error:") ? "failure" : "success",
 			};
 
-			consolidateSession(memory, sessionData)
-				.then((result) => {
-					if (result.episodesCreated > 0 || result.factsExtracted > 0) {
-						console.log(
-							`[memory] Consolidated: ${result.episodesCreated} episodes, ` +
-								`${result.factsExtracted} facts (${result.durationMs}ms)`,
-						);
-					}
-				})
-				.catch((err: unknown) => {
-					const errMsg = err instanceof Error ? err.message : String(err);
-					console.warn(`[memory] Consolidation failed: ${errMsg}`);
-				});
+			const useLLMConsolidation = evolution?.usesLLMJudges() && evolution.isWithinCostCap();
+			if (useLLMConsolidation) {
+				const evolvedConfig = evolution?.getConfig();
+				const existingFacts = evolvedConfig ? `${evolvedConfig.userProfile}\n${evolvedConfig.domainKnowledge}` : "";
+				consolidateSessionWithLLM(memory, sessionData, existingFacts)
+					.then(({ result, judgeCost }) => {
+						if (judgeCost) {
+							evolution?.trackExternalJudgeCost(judgeCost);
+						}
+						if (result.episodesCreated > 0 || result.factsExtracted > 0) {
+							console.log(
+								`[memory] Consolidated (LLM): ${result.episodesCreated} episodes, ` +
+									`${result.factsExtracted} facts (${result.durationMs}ms)`,
+							);
+						}
+					})
+					.catch((err: unknown) => {
+						const errMsg = err instanceof Error ? err.message : String(err);
+						console.warn(`[memory] LLM consolidation failed: ${errMsg}`);
+					});
+			} else {
+				consolidateSession(memory, sessionData)
+					.then((result) => {
+						if (result.episodesCreated > 0 || result.factsExtracted > 0) {
+							console.log(
+								`[memory] Consolidated: ${result.episodesCreated} episodes, ` +
+									`${result.factsExtracted} facts (${result.durationMs}ms)`,
+							);
+						}
+					})
+					.catch((err: unknown) => {
+						const errMsg = err instanceof Error ? err.message : String(err);
+						console.warn(`[memory] Consolidation failed: ${errMsg}`);
+					});
+			}
 		}
 
 		// Evolution pipeline (non-blocking)
